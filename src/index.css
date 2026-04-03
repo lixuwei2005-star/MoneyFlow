@@ -1,0 +1,33 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Outfit", "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  body {
+    @apply antialiased bg-gray-50 dark:bg-black text-gray-900 dark:text-gray-100;
+    transition: background-color 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  
+  * {
+    @apply border-gray-200 dark:border-gray-800;
+  }
+}
+
+/* Smooth theme transitions for cards and buttons */
+.bg-white, .bg-gray-900, .bg-gray-50, .bg-gray-800, .border-gray-100, .border-gray-800 {
+  transition: background-color 0.4s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Optimize animations */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
