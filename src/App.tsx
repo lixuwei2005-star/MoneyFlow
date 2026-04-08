@@ -2,22 +2,34 @@ import React from 'react';
 import { TransactionForm } from './components/TransactionForm';
 import { SettingsModal } from './components/SettingsModal';
 import { CalendarView } from './components/CalendarView';
+import { ShareReportModal } from './components/ShareReportModal';
 import { motion, AnimatePresence } from 'motion/react';
-import { Wallet, History, Plus, X, PieChart as PieChartIcon, Settings as SettingsIcon, TrendingDown, MoreHorizontal, ArrowDownUp, ArrowUp, ArrowDown } from 'lucide-react';
-import { Transaction, TimeFilter, CurrencyCode, Settings, SortOrder } from './types';
+import { Wallet, History, Plus, X, PieChart as PieChartIcon, Settings as SettingsIcon, TrendingDown, MoreHorizontal, ArrowDownUp, ArrowUp, ArrowDown, Calendar, Share2 } from 'lucide-react';
+import { Transaction, TimeFilter, CurrencyCode, Settings, SortOrder, CustomRange } from './types';
 import { CURRENCIES, TRANSLATIONS, EXCHANGE_RATES as MOCK_RATES, APP_VERSION, CATEGORIES } from './constants';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
 import { fetchLatestVersion } from './utils/version';
+import { useAuth } from './contexts/AuthContext';
+import { api } from './utils/api';
+import { SyncStatus, Tombstone } from './types';
 
 const STORAGE_KEY = 'moneyflow_data';
 const SETTINGS_KEY = 'moneyflow_settings';
+const TOMBSTONES_KEY = 'moneyflow_tombstones';
+const SETTINGS_UPDATED_KEY = 'moneyflow_settings_updated_at';
+const LAST_SYNCED_KEY = 'moneyflow_last_synced';
+// Keep old key name only for cleanup
+const LEGACY_VERSION_KEY = 'moneyflow_local_version';
+// Tombstones older than this get pruned during merge
+const TOMBSTONE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 const DEFAULT_SETTINGS: Settings = {
   language: 'zh',
-  monthlyBudget: 5000,
+  monthlyBudget: 0,
   budgetCurrency: 'CNY',
   dashboardCurrency: 'CNY',
   theme: 'auto',
+  autoCheckUpdate: true,
 };
 
 export default function App() {
@@ -64,25 +76,293 @@ export default function App() {
   const [exchangeRates, setExchangeRates] = React.useState(MOCK_RATES);
   const [isAdding, setIsAdding] = React.useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
+  const [isShareOpen, setIsShareOpen] = React.useState(false);
   const [editingTransaction, setEditingTransaction] = React.useState<Transaction | null>(null);
   const [timeFilter, setTimeFilter] = React.useState<TimeFilter>('month');
   const [selectedCalendarDate, setSelectedCalendarDate] = React.useState<Date | null>(null);
+  const [customRange, setCustomRange] = React.useState<CustomRange>(() => {
+    const now = new Date();
+    const startOfYear = new Date(now.getFullYear(), 0, 1);
+    return {
+      start: startOfYear.toISOString().split('T')[0],
+      end: now.toISOString().split('T')[0],
+    };
+  });
   const [sortOrder, setSortOrder] = React.useState<SortOrder>('default');
   const [categoryFilter, setCategoryFilter] = React.useState<string | null>(null);
 
   const t = TRANSLATIONS[settings.language];
   const [isAuthReady, setIsAuthReady] = React.useState(false);
+  const [toast, setToast] = React.useState('');
+
+  // ---------- Cloud sync (merge-based) ----------
+  const { token, isLoggedIn } = useAuth();
+
+  // Cleanup legacy key from old version-based logic
+  React.useEffect(() => {
+    localStorage.removeItem(LEGACY_VERSION_KEY);
+  }, []);
+
+  const [tombstones, setTombstones] = React.useState<Tombstone[]>(() => {
+    try {
+      const raw = localStorage.getItem(TOMBSTONES_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+  const [settingsUpdatedAt, setSettingsUpdatedAt] = React.useState<number>(() => {
+    const v = localStorage.getItem(SETTINGS_UPDATED_KEY);
+    return v ? parseInt(v, 10) || 0 : 0;
+  });
+  const [syncStatus, setSyncStatus] = React.useState<SyncStatus>(() => ({
+    lastSyncedAt: (() => {
+      const v = localStorage.getItem(LAST_SYNCED_KEY);
+      return v ? parseInt(v, 10) || null : null;
+    })(),
+    syncing: false,
+  }));
+
+  // Refs for skipping bumps when applying remote merge
+  const skipSettingsStampRef = React.useRef(true);
+  const skipDirtyRef = React.useRef(true);
+  const dirtyRef = React.useRef(false);
+  const didAutoSyncRef = React.useRef(false);
+  const syncNowRef = React.useRef<((silent?: boolean) => Promise<void>) | null>(null);
+  const isSyncingRef = React.useRef(false);
+
+  // Persist tombstones / settingsUpdatedAt
+  React.useEffect(() => {
+    localStorage.setItem(TOMBSTONES_KEY, JSON.stringify(tombstones));
+  }, [tombstones]);
+  React.useEffect(() => {
+    localStorage.setItem(SETTINGS_UPDATED_KEY, String(settingsUpdatedAt));
+  }, [settingsUpdatedAt]);
+
+  // Stamp settingsUpdatedAt whenever settings changes (skip first render + remote applies)
+  React.useEffect(() => {
+    if (skipSettingsStampRef.current) {
+      skipSettingsStampRef.current = false;
+      return;
+    }
+    setSettingsUpdatedAt(Date.now());
+  }, [settings]);
+
+  // Mark dirty whenever local data changes (skip first render + remote applies)
+  React.useEffect(() => {
+    if (skipDirtyRef.current) {
+      skipDirtyRef.current = false;
+      return;
+    }
+    dirtyRef.current = true;
+  }, [transactions, tombstones, settings, settingsUpdatedAt]);
+
+  const stripIcons = (txs: Transaction[]) =>
+    txs.map((tx) => ({
+      ...tx,
+      category: tx.category ? { ...tx.category, icon: undefined } : tx.category,
+    }));
+
+  const hydrateTransactions = (list: any[]): Transaction[] => {
+    const fallbackCategory = CATEGORIES[CATEGORIES.length - 1];
+    return (list || []).map((tx: any) => {
+      if (!tx || !tx.category) return null;
+      const category = CATEGORIES.find((c) => c.id === tx.category.id) || fallbackCategory;
+      return {
+        ...tx,
+        category: {
+          ...tx.category,
+          icon: category.icon,
+          color: tx.category.color || category.color,
+          name: tx.category.name || category.name,
+        },
+        subCategory: tx.subCategory || { id: 'default', name: tx.category.name || category.name },
+      };
+    }).filter(Boolean) as Transaction[];
+  };
+
+  // Merge two payloads: union of transactions by id (newer updatedAt wins),
+  // skipping any id present in tombstones; tombstones unioned & pruned;
+  // settings: whichever has newer settingsUpdatedAt.
+  type Payload = {
+    transactions: any[];
+    tombstones: Tombstone[];
+    settings: Partial<Settings> | null;
+    settingsUpdatedAt: number;
+  };
+  const mergePayloads = (local: Payload, remote: Payload): Payload => {
+    // Tombstones union (latest deletedAt per id)
+    const tombMap = new Map<string, Tombstone>();
+    for (const t of [...remote.tombstones, ...local.tombstones]) {
+      const cur = tombMap.get(t.id);
+      if (!cur || t.deletedAt > cur.deletedAt) tombMap.set(t.id, t);
+    }
+    // Prune ancient tombstones
+    const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+    const mergedTombstones = Array.from(tombMap.values()).filter((t) => t.deletedAt > cutoff);
+    const tombIds = new Set(mergedTombstones.map((t) => t.id));
+
+    // Transactions: union by id, skip tombstoned, prefer newer updatedAt
+    const txMap = new Map<string, any>();
+    for (const tx of [...remote.transactions, ...local.transactions]) {
+      if (!tx?.id || tombIds.has(tx.id)) continue;
+      const cur = txMap.get(tx.id);
+      const txTs = tx.updatedAt || 0;
+      const curTs = cur?.updatedAt || 0;
+      if (!cur || txTs >= curTs) txMap.set(tx.id, tx);
+    }
+
+    // Settings: newer wins (or fall back to local if neither stamped)
+    const localStamp = local.settingsUpdatedAt || 0;
+    const remoteStamp = remote.settingsUpdatedAt || 0;
+    const useRemote = remoteStamp > localStamp;
+    const mergedSettings = useRemote ? remote.settings : local.settings;
+    const mergedSettingsStamp = Math.max(localStamp, remoteStamp);
+
+    return {
+      transactions: Array.from(txMap.values()),
+      tombstones: mergedTombstones,
+      settings: mergedSettings,
+      settingsUpdatedAt: mergedSettingsStamp,
+    };
+  };
+
+  const applyMerged = (merged: Payload) => {
+    skipDirtyRef.current = true;
+    skipSettingsStampRef.current = true;
+    setTransactions(hydrateTransactions(merged.transactions));
+    setTombstones(merged.tombstones);
+    if (merged.settings) {
+      setSettings((prev: Settings) => ({ ...prev, ...merged.settings }));
+    }
+    setSettingsUpdatedAt(merged.settingsUpdatedAt);
+  };
+
+  const markSynced = (ts: number) => {
+    localStorage.setItem(LAST_SYNCED_KEY, String(ts));
+    setSyncStatus({ lastSyncedAt: ts, syncing: false });
+    dirtyRef.current = false;
+  };
+
+  const syncNow = React.useCallback(async (silent = false) => {
+    if (!token) return;
+    if (isSyncingRef.current) return; // prevent reentrancy
+    isSyncingRef.current = true;
+    setSyncStatus((s) => ({ ...s, syncing: true }));
+    try {
+      // Up to 3 attempts to handle 409 race
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const remote = await api.pull(token);
+        const remotePayload: Payload = remote.payload
+          ? {
+              transactions: (remote.payload as any).transactions || [],
+              tombstones: (remote.payload as any).tombstones || [],
+              settings: (remote.payload as any).settings || null,
+              settingsUpdatedAt: (remote.payload as any).settingsUpdatedAt || 0,
+            }
+          : { transactions: [], tombstones: [], settings: null, settingsUpdatedAt: 0 };
+
+        const localPayload: Payload = {
+          transactions: stripIcons(transactions),
+          tombstones,
+          settings,
+          settingsUpdatedAt,
+        };
+
+        const merged = mergePayloads(localPayload, remotePayload);
+
+        try {
+          const res = await api.push(token, merged as any, remote.version);
+          applyMerged(merged);
+          markSynced(res.updatedAt);
+          if (!silent) showToast(settings.language === 'zh' ? '同步成功 ✓' : 'Synced ✓');
+          return;
+        } catch (err: any) {
+          if (err?.status === 409) {
+            // Server has newer version (race) — re-pull and merge again
+            lastErr = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr || new Error('sync conflict');
+    } catch (err: any) {
+      setSyncStatus((s) => ({ ...s, syncing: false }));
+      if (!silent) {
+        alert((settings.language === 'zh' ? '同步失败：' : 'Sync failed: ') + (err?.message || err));
+      } else {
+        console.warn('[sync] silent fail', err);
+      }
+    } finally {
+      isSyncingRef.current = false;
+    }
+  }, [token, transactions, tombstones, settings, settingsUpdatedAt]);
+
+  // Auto sync on launch (once per mount). Always runs once when logged in,
+  // regardless of autoSync — pulling cloud data on launch is the safest default
+  // when the user is signed in. The autoSync toggle now controls debounced uploads.
+  React.useEffect(() => {
+    if (!isLoggedIn || didAutoSyncRef.current) return;
+    didAutoSyncRef.current = true;
+    syncNow(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoggedIn]);
+
+  // Keep latest syncNow accessible from refs (for debounce / visibility handlers)
+  React.useEffect(() => {
+    syncNowRef.current = syncNow;
+  }, [syncNow]);
+
+  // Debounced auto-upload after edits (5s)
+  React.useEffect(() => {
+    if (!isLoggedIn || !settings.autoSync) return;
+    if (!dirtyRef.current) return;
+    const timer = setTimeout(() => {
+      if (dirtyRef.current) syncNowRef.current?.(true);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [transactions, tombstones, settings, settingsUpdatedAt, isLoggedIn]);
+
+  // Sync on tab hidden / app backgrounded
+  React.useEffect(() => {
+    if (!isLoggedIn) return;
+    const handler = () => {
+      if (document.visibilityState === 'hidden' && dirtyRef.current) {
+        syncNowRef.current?.(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handler);
+    return () => document.removeEventListener('visibilitychange', handler);
+  }, [isLoggedIn]);
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2000);
+  };
 
   // Load data and check updates
   React.useEffect(() => {
-    // Check for updates on mount
-    fetchLatestVersion()
-      .then(data => {
-        if (data.version !== APP_VERSION) {
-          console.log(`[MoneyFlow] New version available: ${data.version}`);
-        }
-      })
-      .catch(() => {});
+    // Check for updates on mount only when the user has the auto-check toggle on
+    if (settings.autoCheckUpdate) {
+      fetchLatestVersion()
+        .then(data => {
+          if (data.version !== APP_VERSION) {
+            console.log(`[MoneyFlow] New version available: ${data.version}`);
+            if (!data.updateUrl) return;
+            const shouldUpdate = window.confirm(
+              `${t.updateFound}: ${data.version}\n${t.updateAction}`
+            );
+            if (!shouldUpdate) return;
+            try {
+              const w = window.open(data.updateUrl, '_blank', 'noopener,noreferrer');
+              if (!w) window.location.href = data.updateUrl;
+            } catch {
+              alert(t.updateOpenFailed);
+            }
+          }
+        })
+        .catch(() => {});
+    }
 
     // Fetch real-time rates
     fetch('https://open.er-api.com/v6/latest/CNY')
@@ -146,12 +426,11 @@ export default function App() {
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
-    
+
     const startOfWeek = new Date(today);
     startOfWeek.setDate(today.getDate() - today.getDay());
-    
+
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const startOfYear = new Date(now.getFullYear(), 0, 1);
 
     return list.filter((item) => {
       const d = new Date(item.date);
@@ -160,7 +439,14 @@ export default function App() {
         case 'yesterday': return d >= yesterday && d < today;
         case 'week': return d >= startOfWeek;
         case 'month': return d >= startOfMonth;
-        case 'year': return d >= startOfYear;
+        case 'custom': {
+          if (!customRange.start || !customRange.end) return true;
+          const start = new Date(customRange.start);
+          start.setHours(0, 0, 0, 0);
+          const end = new Date(customRange.end);
+          end.setHours(23, 59, 59, 999);
+          return d >= start && d <= end;
+        }
         case 'calendar': {
           if (!selectedCalendarDate) return true;
           const target = new Date(selectedCalendarDate.getFullYear(), selectedCalendarDate.getMonth(), selectedCalendarDate.getDate());
@@ -218,39 +504,41 @@ export default function App() {
   const COLORS = ['#f97316', '#3b82f6', '#ec4899', '#6366f1', '#22c55e', '#a855f7', '#ef4444', '#ca8a04', '#b45309', '#0891b2', '#64748b', '#6b7280'];
 
   const handleSave = (transaction: Transaction) => {
+    const stamped = { ...transaction, updatedAt: Date.now() };
     if (editingTransaction) {
-      setTransactions(transactions.map((item) => (item.id === transaction.id ? transaction : item)));
+      setTransactions(transactions.map((item) => (item.id === stamped.id ? stamped : item)));
       setEditingTransaction(null);
     } else {
-      setTransactions([transaction, ...transactions]);
+      setTransactions([stamped, ...transactions]);
     }
     setIsAdding(false);
   };
 
   const handleDelete = (id: string) => {
     setTransactions(transactions.filter((item) => item.id !== id));
+    setTombstones((prev: Tombstone[]) => {
+      // Replace existing tombstone for the same id (rare) or append
+      const filtered = prev.filter((t) => t.id !== id);
+      return [...filtered, { id, deletedAt: Date.now() }];
+    });
     setEditingTransaction(null);
     setIsAdding(false);
   };
 
-  const handleImport = (data: Transaction[]) => {
+  const handleImport = (data: Transaction[], importedSettings?: Partial<Settings>) => {
     try {
-      const fallbackCategory = CATEGORIES[CATEGORIES.length - 1];
-      const hydrated = data.map(t => {
-        if (!t || !t.category) return null;
-        const category = CATEGORIES.find(c => c.id === t.category.id) || fallbackCategory;
-        return {
-          ...t,
-          category: { 
-            ...t.category, 
-            icon: category.icon,
-            color: t.category.color || category.color,
-            name: t.category.name || category.name
-          },
-          subCategory: t.subCategory || { id: 'default', name: t.category.name || category.name }
-        };
-      }).filter(Boolean) as Transaction[];
-      setTransactions(hydrated);
+      const hydrated = hydrateTransactions(data);
+      // Stamp imported records that lack updatedAt so merge treats them as fresh
+      const now = Date.now();
+      const stamped = hydrated.map((tx) => (tx.updatedAt ? tx : { ...tx, updatedAt: now }));
+      setTransactions(stamped);
+      // Importing replaces local data → clear tombstones so old deletions don't
+      // resurrect deleted records from cloud on next sync
+      setTombstones([]);
+      if (importedSettings) {
+        setSettings((prev: Settings) => ({ ...prev, ...importedSettings }));
+      }
+      setSettingsUpdatedAt(now);
       setIsSettingsOpen(false);
     } catch (e) {
       console.error('Failed to import transactions:', e);
@@ -267,6 +555,13 @@ export default function App() {
               <Wallet size={20} />
             </div>
             <h1 className="text-xl font-bold tracking-tight dark:text-white">{t.appName}</h1>
+            <button
+              onClick={() => setIsShareOpen(true)}
+              className="p-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+              aria-label={t.shareReport}
+            >
+              <Share2 size={16} className="text-gray-600 dark:text-gray-400" />
+            </button>
           </div>
           <div className="flex items-center gap-2">
             <select 
@@ -289,7 +584,7 @@ export default function App() {
 
         {/* Time Filters */}
         <div className="flex bg-white dark:bg-gray-900 p-1 rounded-xl border border-gray-100 dark:border-gray-800 shadow-sm overflow-x-auto no-scrollbar">
-          {(['today', 'yesterday', 'week', 'month', 'year', 'calendar'] as TimeFilter[]).map((f) => (
+          {(['today', 'yesterday', 'week', 'month', 'custom', 'calendar'] as TimeFilter[]).map((f) => (
             <button
               key={f}
               onClick={() => {
@@ -308,6 +603,94 @@ export default function App() {
             </button>
           ))}
         </div>
+
+        {/* Custom Range Panel */}
+        {timeFilter === 'custom' && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-white dark:bg-gray-900 rounded-[32px] p-5 border border-gray-100 dark:border-gray-800 shadow-sm space-y-4"
+          >
+            <div className="flex items-center gap-2 text-gray-900 dark:text-white font-bold">
+              <Calendar size={16} />
+              <span className="text-sm">{t.customRange}</span>
+            </div>
+
+            {/* Quick presets */}
+            <div className="grid grid-cols-4 gap-2">
+              {([
+                { key: 'presetThisYear', getRange: () => {
+                    const now = new Date();
+                    return { start: new Date(now.getFullYear(), 0, 1), end: now };
+                  }
+                },
+                { key: 'presetLastYear', getRange: () => {
+                    const now = new Date();
+                    const start = new Date(now);
+                    start.setFullYear(now.getFullYear() - 1);
+                    return { start, end: now };
+                  }
+                },
+                { key: 'presetLastMonth', getRange: () => {
+                    const now = new Date();
+                    const start = new Date(now);
+                    start.setMonth(now.getMonth() - 1);
+                    return { start, end: now };
+                  }
+                },
+                { key: 'presetLastWeek', getRange: () => {
+                    const now = new Date();
+                    const start = new Date(now);
+                    start.setDate(now.getDate() - 7);
+                    return { start, end: now };
+                  }
+                },
+              ] as const).map(preset => {
+                const range = preset.getRange();
+                const startStr = range.start.toISOString().split('T')[0];
+                const endStr = range.end.toISOString().split('T')[0];
+                const isActive = customRange.start === startStr && customRange.end === endStr;
+                return (
+                  <button
+                    key={preset.key}
+                    onClick={() => setCustomRange({ start: startStr, end: endStr })}
+                    className={`px-2 py-2 rounded-xl text-[11px] font-bold transition-all ${
+                      isActive
+                        ? 'bg-gray-900 dark:bg-white text-white dark:text-gray-900 shadow-md'
+                        : 'bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    {t[preset.key]}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Date range inputs */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider">{t.startDate}</span>
+                <input
+                  type="date"
+                  value={customRange.start || ''}
+                  max={customRange.end || undefined}
+                  onChange={(e) => setCustomRange({ ...customRange, start: e.target.value })}
+                  className="w-full p-2.5 bg-gray-50 dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-200 dark:focus:ring-gray-600 transition-all text-xs text-gray-800 dark:text-white"
+                />
+              </div>
+              <div className="space-y-1">
+                <span className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider">{t.endDate}</span>
+                <input
+                  type="date"
+                  value={customRange.end || ''}
+                  min={customRange.start || undefined}
+                  onChange={(e) => setCustomRange({ ...customRange, end: e.target.value })}
+                  className="w-full p-2.5 bg-gray-50 dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-200 dark:focus:ring-gray-600 transition-all text-xs text-gray-800 dark:text-white"
+                />
+              </div>
+            </div>
+          </motion.div>
+        )}
 
         {/* Calendar View */}
         {timeFilter === 'calendar' && (
@@ -335,15 +718,17 @@ export default function App() {
           <div className="relative z-10 space-y-4">
             <div className="space-y-1">
               <span className="text-gray-400 text-xs font-medium uppercase tracking-wider">
-                {timeFilter === 'calendar' && selectedCalendarDate 
-                  ? `${selectedCalendarDate.toLocaleDateString()} ` 
-                  : t[timeFilter]}
+                {timeFilter === 'calendar' && selectedCalendarDate
+                  ? `${selectedCalendarDate.toLocaleDateString()} `
+                  : timeFilter === 'custom'
+                    ? ''
+                    : t[timeFilter]}
                 {t.totalExpense} ({settings.dashboardCurrency})
               </span>
               <div className="flex items-baseline gap-2">
                 <span className="text-xl font-medium text-gray-500">{CURRENCIES[settings.dashboardCurrency].symbol}</span>
                 <span className="text-4xl font-bold tracking-tight">
-                  {totalInDashboardCurrency.toLocaleString(settings.language === 'zh' ? 'zh-CN' : 'en-US', { minimumFractionDigits: 2 })}
+                  {totalInDashboardCurrency.toFixed(2)}
                 </span>
               </div>
             </div>
@@ -363,8 +748,8 @@ export default function App() {
                   />
                 </div>
                 <div className="flex justify-between items-center text-[10px]">
-                  <span className="text-gray-400">{t.budgetRemaining}: <span className={budgetRemaining < 0 ? 'text-red-400' : 'text-green-400'}>{CURRENCIES[settings.budgetCurrency].symbol}{budgetRemaining.toLocaleString()}</span></span>
-                  <span className="text-gray-500">/ {CURRENCIES[settings.budgetCurrency].symbol}{settings.monthlyBudget.toLocaleString()}</span>
+                  <span className="text-gray-400">{t.budgetRemaining}: <span className={budgetRemaining < 0 ? 'text-red-400' : 'text-green-400'}>{CURRENCIES[settings.budgetCurrency].symbol}{budgetRemaining.toFixed(2)}</span></span>
+                  <span className="text-gray-500">/ {CURRENCIES[settings.budgetCurrency].symbol}{settings.monthlyBudget.toFixed(2)}</span>
                 </div>
               </div>
             )}
@@ -394,9 +779,24 @@ export default function App() {
                       <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                     ))}
                   </Pie>
-                  <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)', backgroundColor: settings.theme === 'dark' ? '#111827' : '#fff', color: settings.theme === 'dark' ? '#fff' : '#000' }}
-                    formatter={(value: number) => [`${CURRENCIES[settings.dashboardCurrency].symbol}${value.toFixed(2)}`, t.amount]}
+                  <Tooltip
+                    cursor={false}
+                    wrapperStyle={{ outline: 'none' }}
+                    content={({ active, payload }) => {
+                      if (!active || !payload || !payload.length) return null;
+                      const item: any = payload[0];
+                      return (
+                        <div className="px-3 py-2 rounded-2xl shadow-xl bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700">
+                          <div className="flex items-center gap-2">
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: item.payload?.fill || item.color }} />
+                            <span className="text-xs font-bold text-gray-900 dark:text-white">{item.name}</span>
+                          </div>
+                          <div className="text-sm font-bold text-gray-700 dark:text-gray-300 mt-0.5">
+                            {CURRENCIES[settings.dashboardCurrency].symbol}{Number(item.value).toFixed(2)}
+                          </div>
+                        </div>
+                      );
+                    }}
                   />
                 </PieChart>
               </ResponsiveContainer>
@@ -545,17 +945,19 @@ export default function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
               onClick={() => {
                 setIsAdding(false);
                 setEditingTransaction(null);
               }}
-              className="absolute inset-0 bg-gray-900/40 backdrop-blur-sm"
+              className="absolute inset-0 bg-gray-900/50"
             />
             <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              transition={{ type: "spring", damping: 25, stiffness: 300 }}
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 16 }}
+              transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+              style={{ willChange: 'transform, opacity' }}
               className="relative w-full max-w-md h-[90vh] max-h-[800px]"
             >
               <button
@@ -567,10 +969,11 @@ export default function App() {
               >
                 <X size={20} />
               </button>
-              <TransactionForm 
-                onSave={handleSave} 
+              <TransactionForm
+                onSave={handleSave}
                 onDelete={handleDelete}
-                initialData={editingTransaction} 
+                onSaveSuccess={() => showToast(editingTransaction ? t.editSuccess : t.saveSuccess)}
+                initialData={editingTransaction}
                 language={settings.language}
               />
             </motion.div>
@@ -586,26 +989,75 @@ export default function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
               onClick={() => setIsSettingsOpen(false)}
-              className="absolute inset-0 bg-gray-900/40 backdrop-blur-sm"
+              className="absolute inset-0 bg-gray-900/50"
             />
             <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              transition={{ type: "spring", damping: 25, stiffness: 300 }}
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 16 }}
+              transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+              style={{ willChange: 'transform, opacity' }}
               className="relative w-full max-w-md h-[90vh] max-h-[800px]"
             >
-              <SettingsModal 
-                settings={settings} 
-                onUpdateSettings={setSettings} 
+              <SettingsModal
+                settings={settings}
+                onUpdateSettings={setSettings}
                 onClose={() => setIsSettingsOpen(false)}
                 transactions={transactions}
                 onImport={handleImport}
                 onClear={() => setTransactions([])}
+                syncStatus={syncStatus}
+                onSyncNow={() => syncNow(false)}
               />
             </motion.div>
           </div>
+        )}
+      </AnimatePresence>
+
+      {/* Share Report Modal */}
+      <AnimatePresence>
+        {isShareOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              onClick={() => setIsShareOpen(false)}
+              className="absolute inset-0 bg-gray-900/50"
+            />
+            <motion.div
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 16 }}
+              transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+              style={{ willChange: 'transform, opacity' }}
+              className="relative w-full max-w-md h-[90vh] max-h-[800px]"
+            >
+              <ShareReportModal
+                transactions={transactions}
+                settings={settings}
+                exchangeRates={exchangeRates}
+                onClose={() => setIsShareOpen(false)}
+              />
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Save success toast */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            className="fixed bottom-28 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 bg-gray-900 dark:bg-white text-white dark:text-gray-900 text-sm font-bold rounded-2xl shadow-2xl whitespace-nowrap"
+          >
+            {toast}
+          </motion.div>
         )}
       </AnimatePresence>
     </div>

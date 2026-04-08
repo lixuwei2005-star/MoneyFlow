@@ -3,19 +3,21 @@ import { Category, SubCategory, CURRENCIES, TRANSLATIONS } from '../constants';
 import { CurrencyCode, Transaction, Language } from '../types';
 import { CategoryPicker } from './CategoryPicker';
 import { NumberPad } from './NumberPad';
-import { motion } from 'motion/react';
+import { motion, AnimatePresence } from 'motion/react';
 import { Calendar, Tag, FileText, Globe, Trash2 } from 'lucide-react';
 
 interface TransactionFormProps {
   onSave: (t: Transaction) => void;
   onDelete?: (id: string) => void;
+  onSaveSuccess?: () => void;
   initialData?: Transaction | null;
   language?: Language;
 }
 
-export const TransactionForm: React.FC<TransactionFormProps> = ({ 
-  onSave, 
-  onDelete, 
+export const TransactionForm: React.FC<TransactionFormProps> = ({
+  onSave,
+  onDelete,
+  onSaveSuccess,
   initialData,
   language = 'zh'
 }) => {
@@ -23,19 +25,42 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
   const [amount, setAmount] = React.useState(initialData?.amount.toString() || '0');
   const [currency, setCurrency] = React.useState<CurrencyCode>(initialData?.currency || 'CNY');
   const [selectedCategory, setSelectedCategory] = React.useState<Category | null>(initialData?.category || null);
-  const [selectedSubCategory, setSelectedSubCategory] = React.useState<SubCategory | null>(initialData?.subCategory || null);
+  const [selectedSubCategories, setSelectedSubCategories] = React.useState<SubCategory[]>(() => {
+    if (!initialData?.subCategory || !initialData?.category) return [];
+    const subs: SubCategory[] = initialData.category.subCategories || [];
+    // Parse stored subCategory.name (possibly comma-separated from multi-select save)
+    const names = String(initialData.subCategory.name || '').split(', ').filter(Boolean);
+    const matched = names
+      .map((n) => subs.find((s) => s.name === n))
+      .filter((s): s is SubCategory => !!s);
+    if (matched.length > 0) return matched;
+    // Preserve single legacy selection (but not the "default" placeholder)
+    if (initialData.subCategory.id && initialData.subCategory.id !== 'default') {
+      return [initialData.subCategory];
+    }
+    return [];
+  });
   const [note, setNote] = React.useState(initialData?.note || '');
   const [date, setDate] = React.useState(initialData?.date ? new Date(initialData.date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0]);
+  const [formError, setFormError] = React.useState('');
 
   const handleSave = () => {
     if (parseFloat(amount) <= 0 || !selectedCategory) {
+      setFormError(t.incompleteForm);
+      setTimeout(() => setFormError(''), 2500);
       return;
     }
+    setFormError('');
 
-    const subCategoryToSave = selectedSubCategory || {
-      id: 'default',
-      name: selectedCategory.name
-    };
+    const subCategoryToSave = selectedSubCategories.length > 0
+      ? {
+          id: selectedSubCategories.map((s) => s.id).join('+'),
+          name: selectedSubCategories.map((s) => s.name).join(', '),
+        }
+      : {
+          id: 'default',
+          name: selectedCategory.name,
+        };
 
     onSave({
       id: initialData?.id || Math.random().toString(36).substr(2, 9),
@@ -47,11 +72,20 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
       note,
     });
 
+    onSaveSuccess?.();
+
     if (!initialData) {
       setAmount('0');
       setSelectedCategory(null);
-      setSelectedSubCategory(null);
+      setSelectedSubCategories([]);
       setNote('');
+    }
+  };
+
+  const handleDelete = () => {
+    if (!initialData) return;
+    if (window.confirm(t.confirmDelete)) {
+      onDelete?.(initialData.id);
     }
   };
 
@@ -64,17 +98,23 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
             <span className="text-gray-400 font-medium text-sm">{t.amount}</span>
             {initialData && (
               <button
-                onClick={() => onDelete?.(initialData.id)}
+                onClick={handleDelete}
                 className="p-1.5 bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 transition-colors"
               >
                 <Trash2 size={16} />
               </button>
             )}
           </div>
-          <div className="flex items-center gap-2 bg-gray-800 dark:bg-gray-900 px-2 py-1 rounded-full text-[10px]">
-            <Calendar size={12} />
+          <label className="relative flex items-center gap-2 bg-gray-800 dark:bg-gray-900 px-3.5 py-2 rounded-full text-xs font-medium cursor-pointer hover:bg-gray-700 dark:hover:bg-gray-800 transition-colors">
+            <Calendar size={18} />
             <span>{new Date(date).toLocaleDateString()}</span>
-          </div>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+            />
+          </label>
         </div>
         <div className="flex items-baseline gap-2">
           <span className="text-xl font-medium text-gray-400">{CURRENCIES[currency].symbol}</span>
@@ -115,11 +155,23 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
           </div>
           <CategoryPicker
             selectedCategory={selectedCategory}
-            selectedSubCategory={selectedSubCategory}
-            onSelectCategory={setSelectedCategory}
-            onSelectSubCategory={setSelectedSubCategory}
+            selectedSubCategories={selectedSubCategories}
+            onSelectCategory={(cat) => {
+              setSelectedCategory(cat);
+              // Clear sub-selections when switching to a different category
+              if (cat?.id !== selectedCategory?.id) {
+                setSelectedSubCategories([]);
+              }
+            }}
+            onToggleSubCategory={(sub: SubCategory) => {
+              setSelectedSubCategories((prev) =>
+                prev.some((s) => s.id === sub.id)
+                  ? prev.filter((s) => s.id !== sub.id)
+                  : [...prev, sub]
+              );
+            }}
           />
-          {selectedSubCategory && (
+          {selectedSubCategories.length > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 5 }}
               animate={{ opacity: 1, y: 0 }}
@@ -128,26 +180,14 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
               <div className={`w-7 h-7 rounded-full flex items-center justify-center text-white ${selectedCategory?.color}`}>
                 {selectedCategory && <selectedCategory.icon size={14} />}
               </div>
-              <div className="flex flex-col">
+              <div className="flex flex-col min-w-0">
                 <span className="text-[10px] text-gray-400 dark:text-gray-500 leading-tight">{selectedCategory?.name}</span>
-                <span className="text-xs font-bold text-gray-800 dark:text-gray-200 leading-tight">{selectedSubCategory.name}</span>
+                <span className="text-xs font-bold text-gray-800 dark:text-gray-200 leading-tight truncate">
+                  {selectedSubCategories.map((s) => s.name).join(', ')}
+                </span>
               </div>
             </motion.div>
           )}
-        </div>
-
-        {/* Date Selection */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2 text-gray-400 dark:text-gray-500 text-[10px] font-bold uppercase tracking-wider">
-            <Calendar size={12} />
-            <span>{t.date || '日期'}</span>
-          </div>
-          <input
-            type="date"
-            value={date}
-            onChange={(e) => setDate(e.target.value)}
-            className="w-full p-3 bg-gray-50 dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-200 dark:focus:ring-gray-600 transition-all text-sm text-gray-800 dark:text-white"
-          />
         </div>
 
         {/* Note Input */}
@@ -165,6 +205,20 @@ export const TransactionForm: React.FC<TransactionFormProps> = ({
           />
         </div>
       </div>
+
+      {/* Form error toast */}
+      <AnimatePresence>
+        {formError && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            className="mx-4 mb-2 px-4 py-2 bg-red-500 text-white text-sm font-bold rounded-2xl text-center shadow-lg"
+          >
+            {formError}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Number Pad */}
       <NumberPad value={amount} onChange={setAmount} onConfirm={handleSave} confirmLabel={t.save} />

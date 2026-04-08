@@ -5,16 +5,16 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 
 interface CategoryPickerProps {
   selectedCategory: Category | null;
-  selectedSubCategory: SubCategory | null;
+  selectedSubCategories: SubCategory[];
   onSelectCategory: (category: Category) => void;
-  onSelectSubCategory: (subCategory: SubCategory) => void;
+  onToggleSubCategory: (subCategory: SubCategory) => void;
 }
 
 export const CategoryPicker: React.FC<CategoryPickerProps> = ({
   selectedCategory,
-  selectedSubCategory,
+  selectedSubCategories,
   onSelectCategory,
-  onSelectSubCategory,
+  onToggleSubCategory,
 }) => {
   const [view, setView] = React.useState<'main' | 'sub'>('main');
 
@@ -71,19 +71,22 @@ export const CategoryPicker: React.FC<CategoryPickerProps> = ({
               </span>
             </div>
             <div className="grid grid-cols-3 gap-3">
-              {selectedCategory?.subCategories.map((sub) => (
-                <button
-                  key={sub.id}
-                  onClick={() => onSelectSubCategory(sub)}
-                  className={`px-3 py-2 rounded-xl text-sm font-medium transition-all ${
-                    selectedSubCategory?.id === sub.id
-                      ? 'bg-gray-900 dark:bg-white text-white dark:text-gray-900 shadow-md'
-                      : 'bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
-                  }`}
-                >
-                  {sub.name}
-                </button>
-              ))}
+              {selectedCategory?.subCategories.map((sub) => {
+                const isSelected = selectedSubCategories.some((s) => s.id === sub.id);
+                return (
+                  <button
+                    key={sub.id}
+                    onClick={() => onToggleSubCategory(sub)}
+                    className={`px-3 py-2 rounded-xl text-sm font-medium transition-all ${
+                      isSelected
+                        ? 'bg-gray-900 dark:bg-white text-white dark:text-gray-900 shadow-md'
+                        : 'bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    {sub.name}
+                  </button>
+                );
+              })}
             </div>
           </motion.div>
         )}

@@ -124,14 +124,11 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 {day}
               </span>
               {total > 0 && (
-                <span className={`text-[8px] mt-1 font-medium truncate w-full px-1 text-center ${
-                  isSelected ? 'text-white/70 dark:text-gray-500' : 'text-gray-400 dark:text-gray-500'
+                <span className={`text-[8px] mt-0.5 font-medium truncate w-full px-1 text-center ${
+                  isSelected ? 'text-white/70 dark:text-gray-500' : 'text-gray-500 dark:text-gray-400'
                 }`}>
                   {total > 999 ? `${(total/1000).toFixed(1)}k` : total.toFixed(0)}
                 </span>
-              )}
-              {total > 0 && !isSelected && (
-                <div className="absolute bottom-1.5 w-1 h-1 rounded-full bg-orange-500" />
               )}
             </button>
           );
